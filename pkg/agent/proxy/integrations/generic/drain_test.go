@@ -11,6 +11,7 @@ import (
 
 	proxyutil "go.keploy.io/server/v3/pkg/agent/proxy/util"
 	"go.keploy.io/server/v3/pkg/models"
+	"go.keploy.io/server/v3/pkg/neterr"
 	"go.uber.org/zap"
 )
 
@@ -290,5 +291,71 @@ func TestEncodeGeneric_CleanThenResetReturnsPromptly(t *testing.T) {
 		t.Fatalf("returned after %v, most of one %v window, with both copy results already "+
 			"available. In production that dead time is %v per clean-then-reset connection.",
 			elapsed, testDrainIdle, proxyutil.RelayDrainIdle)
+	}
+}
+
+// TestEncodeGeneric_PassesAResetOnAndEndsOnIt is
+// proxyutil's TestRelayRawPassthrough_PassesAResetOnAndEndsOnIt on generic's
+// own capturing copy loop: a peer that resets is gone both ways, so the
+// other peer is reset too and the exchange ends on that event, with no
+// survivor drain. Before the fix an eager client (it speaks, then closes
+// with the reply unread, which is a reset) held the connection for a whole
+// idle window, 30s in production, while its destination waited for the
+// next request. No clock decides anything: the drain and the waiting peer's
+// read are both events.
+func TestEncodeGeneric_PassesAResetOnAndEndsOnIt(t *testing.T) {
+	for _, destResets := range []bool{false, true} {
+		name := "the client resets"
+		if destResets {
+			name = "the destination resets"
+		}
+		t.Run(name, func(t *testing.T) {
+			clientApp, srcProxy := prodPair(t, true)
+			destSvc, dstProxy := prodPair(t, false)
+
+			drained := make(chan struct{})
+			returned := make(chan struct{})
+			go func() {
+				_ = encodeGenericDrained(context.Background(), zap.NewNop(), nil, srcProxy, dstProxy,
+					make(chan *models.Mock, 64), models.OutgoingOptions{},
+					func(finished <-chan copyOutcome, _ func() int64) {
+						close(drained)
+						<-finished // the test's close of the sockets ends it
+					})
+				close(returned)
+			}()
+
+			req := []byte("EHLO eager\r\n")
+			if _, err := clientApp.Write(req); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if _, err := io.ReadFull(destSvc, make([]byte, len(req))); err != nil {
+				t.Fatalf("the request did not reach the destination: %v", err)
+			}
+			gone, waiting := clientApp, destSvc
+			if destResets {
+				gone, waiting = destSvc, clientApp
+			}
+			if err := gone.(*net.TCPConn).SetLinger(0); err != nil {
+				t.Fatalf("linger: %v", err)
+			}
+			_ = gone.Close()
+
+			select {
+			case <-returned:
+			case <-drained:
+				t.Fatal("generic waited on a survivor after a peer reset: the survivor writes to " +
+					"the peer that is gone, and the other peer, never told, waits for the next " +
+					"request for a whole idle window, " + proxyutil.RelayDrainIdle.String() +
+					" in production")
+			}
+			// The caller closes the real sockets once encode returns.
+			closeUnderlying(t, srcProxy)
+			closeUnderlying(t, dstProxy)
+			if _, err := waiting.Read(make([]byte, 1)); !neterr.IsConnReset(err) {
+				t.Fatalf("the waiting peer read %v; want a reset. A FIN, or nothing, tells it "+
+					"the other peer ended cleanly or is still there, when it reset", err)
+			}
+		})
 	}
 }

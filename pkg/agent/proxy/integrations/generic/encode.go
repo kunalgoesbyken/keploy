@@ -78,6 +78,16 @@ func encodeGeneric(ctx context.Context, logger *zap.Logger, reqBuf []byte, clien
 // the production window. Production has exactly one caller, above, and it
 // always passes proxyutil.RelayDrainIdle.
 func encodeGenericWithDrain(ctx context.Context, logger *zap.Logger, reqBuf []byte, clientConn, destConn net.Conn, mocks chan<- *models.Mock, opts models.OutgoingOptions, drainIdle time.Duration) error {
+	return encodeGenericDrained(ctx, logger, reqBuf, clientConn, destConn, mocks, opts,
+		func(finished <-chan copyOutcome, delivered func() int64) {
+			proxyutil.WaitForSurvivor(finished, delivered, drainIdle)
+		})
+}
+
+// encodeGenericDrained is encodeGeneric with the survivor drain as a
+// parameter, so a test can see whether it waits on a survivor at all, as an
+// event, without a clock.
+func encodeGenericDrained(ctx context.Context, logger *zap.Logger, reqBuf []byte, clientConn, destConn net.Conn, mocks chan<- *models.Mock, opts models.OutgoingOptions, drain func(finished <-chan copyOutcome, delivered func() int64)) error {
 
 	// Forward initial request buffer to destination immediately.
 	_, err := destConn.Write(reqBuf)
@@ -132,7 +142,8 @@ func encodeGenericWithDrain(ctx context.Context, logger *zap.Logger, reqBuf []by
 	}
 	go func() {
 		defer clientCloseOnce.Do(func() { close(clientCapChan) })
-		_, err := io.Copy(tees[0], clientConn)
+		from := &proxyutil.ReadRecorder{R: clientConn}
+		_, err := io.Copy(tees[0], from)
 		// Close the capture channel BEFORE the FIN: forwardFIN can write
 		// a close_notify on a TLS conn, and SafeConn's write deadline is
 		// a no-op, so a stalled peer would otherwise hold
@@ -140,18 +151,28 @@ func encodeGenericWithDrain(ctx context.Context, logger *zap.Logger, reqBuf []by
 		// sync.Once, so this is the early half of the same close.
 		clientCloseOnce.Do(func() { close(clientCapChan) })
 		forwardFIN(destConn, err)
-		done <- copyOutcome{idx: 0, err: err}
+		reset := err != nil && proxyutil.PassOnReset(destConn, from.Err)
+		done <- copyOutcome{idx: 0, err: err, peerReset: reset}
 	}()
 	go func() {
 		defer destCloseOnce.Do(func() { close(destCapChan) })
-		_, err := io.Copy(tees[1], destConn)
+		from := &proxyutil.ReadRecorder{R: destConn}
+		_, err := io.Copy(tees[1], from)
 		destCloseOnce.Do(func() { close(destCapChan) })
 		forwardFIN(clientConn, err)
-		done <- copyOutcome{idx: 1, err: err}
+		reset := err != nil && proxyutil.PassOnReset(clientConn, from.Err)
+		done <- copyOutcome{idx: 1, err: err, peerReset: reset}
 	}()
 
 	for i := 0; i < 2; i++ {
 		res := <-done
+		// A peer that reset is gone both ways: the survivor writes to it,
+		// so there is nothing left to drain. End on this event; the
+		// caller's close sends the reset PassOnReset passed on to the other
+		// peer (proxyutil.RelayRawPassthrough has the same rule).
+		if res.peerReset {
+			return nil
+		}
 		if res.err == nil {
 			continue
 		}
@@ -171,7 +192,7 @@ func encodeGenericWithDrain(ctx context.Context, logger *zap.Logger, reqBuf []by
 		//
 		// A copy error is a peer/socket condition, not a parser fault, so
 		// the dispatcher still sees nil.
-		proxyutil.WaitForSurvivor(done, tees[1-res.idx].delivered, drainIdle)
+		drain(done, tees[1-res.idx].delivered)
 		return nil
 	}
 
@@ -182,6 +203,9 @@ func encodeGenericWithDrain(ctx context.Context, logger *zap.Logger, reqBuf []by
 type copyOutcome struct {
 	idx int
 	err error
+	// peerReset is set when the direction's SOURCE peer reset the
+	// connection (proxyutil.PassOnReset).
+	peerReset bool
 }
 
 // forwardFIN half-closes dst when the copy that fed it ended cleanly.

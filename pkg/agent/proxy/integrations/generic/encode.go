@@ -106,13 +106,18 @@ func encodeGenericDrained(ctx context.Context, logger *zap.Logger, reqBuf []byte
 	clientCapChan := make(chan []byte, 256)
 	destCapChan := make(chan []byte, 256)
 
-	// Seed initial request buffer into capture.
+	// The initial request is the connection's first chunk, known before
+	// either copy starts, so it is handed to the mock creator directly. On
+	// clientCapChan it raced the reply: the creator selects between the two
+	// channels at random when both hold data, so one that started after the
+	// reply was buffered (a loaded host) took the reply first, as a reply
+	// with no request, and dropped it when the request came; the exchange's
+	// mock was lost.
 	initialBuf := make([]byte, len(reqBuf))
 	copy(initialBuf, reqBuf)
-	clientCapChan <- initialBuf
 
 	// Start background mock creator.
-	go createGenericMocksAsync(ctx, logger, clientCapChan, destCapChan)
+	go createGenericMocksAsync(ctx, logger, initialBuf, clientCapChan, destCapChan)
 
 	// Forward bidirectionally at wire speed with non-blocking capture tee.
 	// Each tee writer shares a closeOnce with the deferred close so the
@@ -262,7 +267,14 @@ func forwardBidirectional(clientConn, destConn net.Conn) error {
 // various binary RPC), responses are almost always a single write and
 // therefore one io.Copy chunk. A future protocol-aware parser should
 // supersede generic where framing matters.
-func createGenericMocksAsync(ctx context.Context, logger *zap.Logger, clientCh, destCh <-chan []byte) {
+//
+// first, when not nil, is the connection's first request chunk, read before
+// either channel was fed (encodeGenericDrained's initial request). Later
+// chunks still cross two channels, whose relative order a creator that lags
+// behind both cannot know. The live record path, encode_v2.go, orders chunks
+// by their capture numbers; this one is reached only for a parser that is
+// not V2 (shouldRecordViaSupervisor in the proxy), which generic is not.
+func createGenericMocksAsync(ctx context.Context, logger *zap.Logger, first []byte, clientCh, destCh <-chan []byte) {
 	var genericRequests []models.Payload
 	var genericResponses []models.Payload
 	prevChunkWasReq := true // first chunk is always a request (initial reqBuf)
@@ -363,6 +375,11 @@ func createGenericMocksAsync(ctx context.Context, logger *zap.Logger, clientCh, 
 				release(false)
 			}
 		}
+	}
+
+	if first != nil {
+		genericRequests = append(genericRequests, encodePayload(first, models.FromClient))
+		saw(models.CapturedReqTime(ctx))
 	}
 
 	for clientCh != nil || destCh != nil {

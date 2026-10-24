@@ -5,10 +5,14 @@ import (
 	"context"
 	"io"
 	"net"
+	"os"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	syncMock "go.keploy.io/server/v3/pkg/agent/proxy/syncMock"
 	proxyutil "go.keploy.io/server/v3/pkg/agent/proxy/util"
 	"go.keploy.io/server/v3/pkg/models"
 	"go.keploy.io/server/v3/pkg/neterr"
@@ -357,5 +361,213 @@ func TestEncodeGeneric_PassesAResetOnAndEndsOnIt(t *testing.T) {
 					"the other peer ended cleanly or is still there, when it reset", err)
 			}
 		})
+	}
+}
+
+// resetWriteConn fails every Write with a reset once armed, while Read keeps
+// working: the proxy's write to a destination that has reset, whose last
+// reply is still to be read.
+type resetWriteConn struct {
+	net.Conn
+	armed atomic.Bool
+}
+
+func (c *resetWriteConn) Write(p []byte) (int, error) {
+	if c.armed.Load() {
+		return 0, &net.OpError{Op: "write", Net: "tcp",
+			Err: &os.SyscallError{Syscall: "write", Err: syscall.ECONNRESET}}
+	}
+	return c.Conn.Write(p)
+}
+
+// See splitReadConn: an embedded net.Conn interface does not promote it.
+func (c *resetWriteConn) CloseWrite() error { return proxyutil.CloseWriteIfPossible(c.Conn) }
+
+// TestEncodeGeneric_AResetWriteStillDrainsTheSurvivor is proxyutil's
+// TestRelayRawPassthrough_AResetWriteStillDrainsTheSurvivor on generic's own
+// capturing copy loop, whose two directions are two copies of the rule, so
+// both are driven. A write that fails with a reset says the DESTINATION of
+// that write is gone, not the copy's source, so generic passes no reset on
+// and drains the other direction: it reads that gone peer, which may still
+// hold its last bytes (a server's 413 before it resets an upload it will not
+// read). Telling the two apart is why each copy reads its source's error
+// (proxyutil.ReadRecorder), not io.Copy's: a copy that took io.Copy's error
+// would end generic at once on the failed write, and the caller's close
+// would drop those bytes (and, from the destination, the mock of the
+// exchange). No clock decides anything: the drain starting is an event.
+func TestEncodeGeneric_AResetWriteStillDrainsTheSurvivor(t *testing.T) {
+	for _, clientGone := range []bool{false, true} {
+		name := "the write to the destination fails"
+		if clientGone {
+			name = "the write to the client fails"
+		}
+		t.Run(name, func(t *testing.T) {
+			clientApp, srcProxy := prodPair(t, true)
+			destSvc, dstProxy := prodPair(t, false)
+			// goner is the peer that is gone for writes; other is the one whose
+			// bytes are written to it.
+			var clientConn, destConn net.Conn = srcProxy, dstProxy
+			gone, goner, other := &resetWriteConn{Conn: dstProxy}, destSvc, clientApp
+			destConn = gone
+			if clientGone {
+				gone, goner, other = &resetWriteConn{Conn: srcProxy}, clientApp, destSvc
+				clientConn, destConn = gone, dstProxy
+			}
+
+			out := make(chan *models.Mock, 4)
+			mgr := syncMock.New(zap.NewNop())
+			mgr.SetOutputChannel(out)
+			ctx := syncMock.NewContext(context.WithValue(context.Background(), models.ClientConnectionIDKey, "c1"), mgr)
+			// The mock creator starts once encode has returned, with the
+			// whole exchange buffered, as on a loaded host: what it makes of
+			// it cannot depend on when it was scheduled.
+			ctx, startRecorder := holdRecorderStart(t, ctx)
+
+			drained := make(chan struct{})
+			returned := make(chan struct{})
+			req := []byte("PUT /upload\r\n")
+			go func() {
+				_ = encodeGenericDrained(ctx, zap.NewNop(), req, clientConn, destConn,
+					make(chan *models.Mock, 64), models.OutgoingOptions{},
+					func(finished <-chan copyOutcome, _ func() int64) {
+						close(drained)
+						<-finished // the test's close of the sockets ends it
+					})
+				close(returned)
+			}()
+			if _, err := io.ReadFull(destSvc, make([]byte, len(req))); err != nil {
+				t.Fatalf("the request did not reach the destination: %v", err)
+			}
+
+			// Writes to the gone peer now fail with a reset, and the other
+			// peer's next bytes are written there.
+			gone.armed.Store(true)
+			if _, err := other.Write([]byte("more")); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			select {
+			case <-drained:
+			case <-returned:
+				t.Fatal("generic ended at once on a failed write, as if the copy's source had reset. " +
+					"The survivor still reads the gone peer and may hold its last bytes; ending now " +
+					"lets the caller's close drop them")
+			}
+			// The gone peer's last bytes, sent before it went, still reach the
+			// other peer through the survivor.
+			last := []byte("413 too large\r\n")
+			if _, err := goner.Write(last); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			got := make([]byte, len(last))
+			if _, err := io.ReadFull(other, got); err != nil || !bytes.Equal(got, last) {
+				t.Fatalf("the survivor delivered %q, %v; want the gone peer's last bytes %q", got, err, last)
+			}
+
+			// The caller closes the real sockets once encode returns; here that
+			// close is what ends the drain, and the capture flushes the exchange.
+			closeUnderlying(t, srcProxy)
+			closeUnderlying(t, dstProxy)
+			<-returned
+			startRecorder()
+			if clientGone {
+				// The reply that failed to reach the client was not captured, so
+				// the exchange has no reply and no mock; delivery is the check.
+				return
+			}
+			select {
+			case m := <-out:
+				if len(m.Spec.GenericRequests) == 0 || m.Spec.GenericRequests[0].Message[0].Data != string(req) {
+					t.Fatalf("the mock's request is %+v; want %q", m.Spec.GenericRequests, req)
+				}
+				if len(m.Spec.GenericResponses) == 0 || m.Spec.GenericResponses[0].Message[0].Data != string(last) {
+					t.Fatalf("the mock's reply is %+v; want the destination's %q, which arrived after "+
+						"the failed write", m.Spec.GenericResponses, last)
+				}
+			case <-time.After(30 * time.Second): // a hang guard, far above any run
+				t.Fatal("no mock was captured for the exchange")
+			}
+		})
+	}
+}
+
+// holdRecorderStart returns ctx with a captured-request-time source whose
+// first call, the mock creator's first act (createGenericMocksAsync), waits
+// for start: the creator is scheduled after its connection's chunks are
+// buffered, as a loaded host can schedule it. A test that ends before it
+// calls start still releases the creator, at its cleanup, so that no
+// goroutine is left blocked behind it.
+func holdRecorderStart(t *testing.T, ctx context.Context) (context.Context, func()) {
+	release := make(chan struct{})
+	var once sync.Once
+	at := func() time.Time {
+		once.Do(func() { <-release })
+		return time.Time{} // models.CapturedReqTime then reads the clock
+	}
+	var startOnce sync.Once
+	start := func() { startOnce.Do(func() { close(release) }) }
+	t.Cleanup(start)
+	return context.WithValue(ctx, models.CapturedReqTimeKey, at), start
+}
+
+// TestEncodeGeneric_AFirstReplyBufferedBeforeTheRecorderStartsKeepsItsMock:
+// encode wrote the initial request and started the mock creator, and the
+// whole exchange was relayed before the creator first ran (a loaded host).
+// The initial request reached the creator on clientCapChan, so with the
+// reply on destCapChan both channels held data, and a select picks among
+// ready channels at random: half the time it took the reply first, as a
+// reply with no request, then dropped it when the request came, and the
+// connection's only exchange had no mock. The initial request is known
+// before either copy starts, so the creator now has it before it reads
+// either channel. Each round is a fresh connection; a creator that can
+// still take the reply first fails one of them with odds 1 - 2^-16, and
+// none passes by luck of timing, since the order is fixed by the hold.
+func TestEncodeGeneric_AFirstReplyBufferedBeforeTheRecorderStartsKeepsItsMock(t *testing.T) {
+	for round := 0; round < 16; round++ {
+		clientApp, srcProxy := prodPair(t, true)
+		destSvc, dstProxy := prodPair(t, false)
+		out := make(chan *models.Mock, 4)
+		mgr := syncMock.New(zap.NewNop())
+		mgr.SetOutputChannel(out)
+		ctx := syncMock.NewContext(context.WithValue(context.Background(), models.ClientConnectionIDKey, "c1"), mgr)
+		ctx, startRecorder := holdRecorderStart(t, ctx)
+
+		req, reply := []byte("ping\r\n"), []byte("pong\r\n")
+		returned := make(chan struct{})
+		go func() {
+			_ = encodeGeneric(ctx, zap.NewNop(), req, srcProxy, dstProxy,
+				make(chan *models.Mock, 64), models.OutgoingOptions{})
+			close(returned)
+		}()
+		if _, err := io.ReadFull(destSvc, make([]byte, len(req))); err != nil {
+			t.Fatalf("round %d: the request did not reach the destination: %v", round, err)
+		}
+		if _, err := destSvc.Write(reply); err != nil {
+			t.Fatalf("round %d: write: %v", round, err)
+		}
+		got := make([]byte, len(reply))
+		if _, err := io.ReadFull(clientApp, got); err != nil || !bytes.Equal(got, reply) {
+			t.Fatalf("round %d: the client read %q, %v; want %q", round, got, err, reply)
+		}
+		// Both peers end cleanly, so encode returns with both capture
+		// channels closed and the reply buffered; then the creator starts.
+		if err := clientApp.(*net.TCPConn).CloseWrite(); err != nil {
+			t.Fatalf("round %d: half-close: %v", round, err)
+		}
+		if err := destSvc.(*net.TCPConn).CloseWrite(); err != nil {
+			t.Fatalf("round %d: half-close: %v", round, err)
+		}
+		<-returned
+		startRecorder()
+		select {
+		case m := <-out:
+			if len(m.Spec.GenericRequests) != 1 || m.Spec.GenericRequests[0].Message[0].Data != string(req) ||
+				len(m.Spec.GenericResponses) != 1 || m.Spec.GenericResponses[0].Message[0].Data != string(reply) {
+				t.Fatalf("round %d: the mock is %+v -> %+v; want %q -> %q", round,
+					m.Spec.GenericRequests, m.Spec.GenericResponses, req, reply)
+			}
+		case <-time.After(30 * time.Second): // a hang guard, far above any run
+			t.Fatalf("round %d: no mock was captured for the connection's only exchange: the "+
+				"creator took the buffered reply before the initial request and dropped it", round)
+		}
 	}
 }

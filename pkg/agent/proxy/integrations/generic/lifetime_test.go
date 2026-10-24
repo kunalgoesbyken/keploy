@@ -59,7 +59,7 @@ func TestTheRecordersStateAConnectionsPreambleSessionAndTheRestPerTest(t *testin
 			close(clientCh)
 			close(destCh)
 		}()
-		createGenericMocksAsync(ctx, zap.NewNop(), clientCh, destCh)
+		createGenericMocksAsync(ctx, zap.NewNop(), nil, clientCh, destCh)
 		var got []*models.Mock
 		for len(got) < 3 {
 			got = append(got, <-out)
@@ -604,7 +604,7 @@ func TestLegacyAConnectionWhollyInsideATestIsThatTestsWhole(t *testing.T) {
 		}()
 		done := make(chan struct{})
 		go func() {
-			createGenericMocksAsync(ctx, zap.NewNop(), clientCh, destCh)
+			createGenericMocksAsync(ctx, zap.NewNop(), nil, clientCh, destCh)
 			close(done)
 		}()
 		if inWindow {
